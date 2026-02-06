@@ -30899,6 +30899,433 @@ function scheduleLogic(i) {
 })();
 </script>
 
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     Mountain Patch v2 — Self-contained parallax mountain renderer
+     Replaces ALL original mountain drawing paths with a single authoritative
+     pipeline that runs at a deterministic point in every frame.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+<script>
+(function () {
+    'use strict';
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 0) Guard: need Renderer + Game
+    // ─────────────────────────────────────────────────────────────────────────
+    if (typeof Renderer === 'undefined' || !Renderer.prototype) return;
+    if (typeof Game === 'undefined' || !Game.prototype) return;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 1) Disable ALL original mountain drawing paths
+    //    Original code draws mountains via:
+    //    a) renderParallax() — called from renderBackgroundCached or Game.render
+    //    b) renderSky() tail — "TU Mount Fix Logic" for reduced-motion fallback
+    //    We replace renderParallax to call OUR draw function, and suppress the
+    //    renderSky tail. This ensures exactly ONE mountain draw per frame.
+    // ─────────────────────────────────────────────────────────────────────────
+
+
+    // Suppress the "TU Mount Fix Logic" tail in renderSky (lines 16195-16215
+    // in original). When renderSky is called, we force _bgCacheDrawing = true
+    // which makes the mountain-drawing tail inside renderSky a no-op.
+    var _origRenderSky = Renderer.prototype.renderSky;
+    if (_origRenderSky) {
+        Renderer.prototype.renderSky = function (cam, time) {
+            var prev = this._bgCacheDrawing;
+            this._bgCacheDrawing = true; // suppress mountain tail in renderSky
+            try {
+                return _origRenderSky.call(this, cam, time);
+            } finally {
+                this._bgCacheDrawing = prev;
+            }
+        };
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 2) Noise utilities (identical to original _PX)
+    // ─────────────────────────────────────────────────────────────────────────
+    var _hash = function (n) {
+        n = (n << 13) ^ n;
+        return 1.0 - (((n * (n * n * 15731 + 789221) + 1376312589) & 0x7fffffff) / 1073741824.0);
+    };
+    var _smooth = function (t) { return t * t * (3 - 2 * t); };
+    var _noise1 = function (x, seed) {
+        var i = Math.floor(x);
+        var f = x - i;
+        var a = _hash((i + seed) | 0);
+        var b = _hash((i + 1 + seed) | 0);
+        return a + (b - a) * _smooth(f);
+    };
+    var _fbm = function (x, seed, oct) {
+        oct = oct || 4;
+        var v = 0, amp = 0.55, freq = 1;
+        for (var o = 0; o < oct; o++) {
+            v += amp * _noise1(x * freq, seed + o * 101);
+            freq *= 2; amp *= 0.5;
+        }
+        return v;
+    };
+    var _ridged = function (x, seed, oct) {
+        oct = oct || 4;
+        var v = 0, amp = 0.65, freq = 1;
+        for (var o = 0; o < oct; o++) {
+            var n = _noise1(x * freq, seed + o * 131);
+            n = 1 - Math.abs(n);
+            v += (n * n) * amp;
+            freq *= 2; amp *= 0.55;
+        }
+        return v;
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 3) Layer definitions (identical palettes & params to original)
+    // ─────────────────────────────────────────────────────────────────────────
+    var LAYERS = [
+        {
+            p: 0.05, y: 260, amp: 145, freq: 0.0019, detail: 0.0065, sharp: 1.60, seed: 17,
+            snow: true, snowLine: 0.74,
+            palette: {
+                night: ['#070a18', '#111a33'], dawn: ['#20122f', '#3a1f48'],
+                day: ['#b7d4f4', '#7a9cc2'], dusk: ['#1c1430', '#3b2953']
+            }
+        },
+        {
+            p: 0.10, y: 215, amp: 120, freq: 0.0025, detail: 0.0078, sharp: 1.45, seed: 33,
+            snow: true, snowLine: 0.76,
+            palette: {
+                night: ['#0b1024', '#18284a'], dawn: ['#2a1430', '#5a2a3f'],
+                day: ['#9cc0e0', '#5f86b5'], dusk: ['#22193f', '#5a3b6d']
+            }
+        },
+        {
+            p: 0.18, y: 165, amp: 105, freq: 0.0034, detail: 0.0105, sharp: 1.30, seed: 57,
+            snow: false,
+            palette: {
+                night: ['#111c2c', '#243a4e'], dawn: ['#3a2340', '#7a3b4b'],
+                day: ['#7db6c9', '#3d6f86'], dusk: ['#2b2447', '#7a4b6d']
+            }
+        },
+        {
+            p: 0.30, y: 110, amp: 90, freq: 0.0046, detail: 0.0135, sharp: 1.18, seed: 89,
+            snow: false,
+            palette: {
+                night: ['#162a2f', '#2f4a45'], dawn: ['#3a2f3c', '#8a4a4a'],
+                day: ['#5fa39b', '#2f6b5f'], dusk: ['#2a2f47', '#6a5a6d']
+            }
+        },
+        {
+            p: 0.45, y: 65, amp: 70, freq: 0.0060, detail: 0.0180, sharp: 1.10, seed: 123,
+            snow: false,
+            palette: {
+                night: ['#1b2a2a', '#3a4a3f'], dawn: ['#3a2a2a', '#7a3a2f'],
+                day: ['#4f8a4f', '#2e5f35'], dusk: ['#2a2a3a', '#4a3a3f']
+            }
+        }
+    ];
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 4) Chunk-based mountain renderer
+    // ─────────────────────────────────────────────────────────────────────────
+    var CHUNK_W = 512;
+    var OVERLAP = 64;
+    var PAD_CHUNKS = 2;
+
+    function makeOffscreen(cw, ch) {
+        var c = null;
+        if (typeof OffscreenCanvas !== 'undefined') {
+            try { c = new OffscreenCanvas(cw, ch); } catch (_) { c = null; }
+        }
+        if (!c) { c = document.createElement('canvas'); }
+        c.width = cw; c.height = ch;
+        return c;
+    }
+    function getCtx2d(c) {
+        try { return c.getContext('2d', { alpha: true }); }
+        catch (_) {
+            try { return c.getContext('2d'); } catch (__) { return null; }
+        }
+    }
+
+    function getTheme(renderer, time) {
+        // Replicate the sky bucket → theme logic identically
+        if (typeof renderer._getSkyBucket === 'function') {
+            var b = renderer._getSkyBucket(time);
+            if (b < 20) return 'night';
+            if (b < 30) return 'dawn';
+            if (b < 70) return 'day';
+            if (b < 80) return 'dusk';
+            return 'night';
+        }
+        if (time < 0.2) return 'night';
+        if (time < 0.3) return 'dawn';
+        if (time < 0.7) return 'day';
+        if (time < 0.8) return 'dusk';
+        return 'night';
+    }
+
+    function buildChunk(layer, li, chunkIndex, theme, h, step, low) {
+        var fullW = CHUNK_W + OVERLAP * 2;
+        var canvas = makeOffscreen(fullW, h);
+        var g = getCtx2d(canvas);
+        if (!g) return { canvas: canvas };
+
+        g.clearRect(0, 0, fullW, h);
+
+        // Gradient fill
+        var cols = (layer.palette && layer.palette[theme])
+            ? layer.palette[theme]
+            : ['#222', '#444'];
+        var grad = g.createLinearGradient(0, h - layer.y - 160, 0, h);
+        grad.addColorStop(0, cols[0]);
+        grad.addColorStop(1, cols[1]);
+        g.fillStyle = grad;
+
+        var worldStart = chunkIndex * CHUNK_W;
+        var x0 = -OVERLAP;
+        var x1 = CHUNK_W + OVERLAP;
+
+        var pts = []; // [cx, y, hh, ...]
+        var ridgeStroke = (theme === 'day') ? 'rgba(255,255,255,0.20)' : 'rgba(220,230,255,0.14)';
+        var snowStroke = (theme === 'day') ? 'rgba(255,255,255,0.75)' : 'rgba(220,230,255,0.55)';
+
+        // Contour path
+        g.beginPath();
+        g.moveTo(0, h + 2);
+
+        for (var x = x0; x < x1; x += step) {
+            var wx = worldStart + x;
+            var r = _ridged(wx * layer.freq, layer.seed);
+            var f = _fbm(wx * layer.detail, layer.seed + 999);
+            var contour = 0.72 * r + 0.28 * Math.pow(r, layer.sharp || 1.2);
+            var wobble = 0.86 + 0.14 * f;
+            var hh = layer.amp * contour * wobble;
+            var y = h - layer.y - hh;
+            var cx = x + OVERLAP;
+            pts.push(cx, y, hh);
+            g.lineTo(cx, y);
+        }
+        // End-cap
+        {
+            var xe = x1;
+            var wxe = worldStart + xe;
+            var re = _ridged(wxe * layer.freq, layer.seed);
+            var fe = _fbm(wxe * layer.detail, layer.seed + 999);
+            var ce = 0.72 * re + 0.28 * Math.pow(re, layer.sharp || 1.2);
+            var we = 0.86 + 0.14 * fe;
+            var hhe = layer.amp * ce * we;
+            var ye = h - layer.y - hhe;
+            var cxe = xe + OVERLAP;
+            pts.push(cxe, ye, hhe);
+            g.lineTo(cxe, ye);
+        }
+
+        g.lineTo(fullW, h + 2);
+        g.closePath();
+        g.fill();
+
+        // Ridge highlight
+        g.save();
+        g.globalAlpha = low ? 0.10 : (0.12 + li * 0.02);
+        g.strokeStyle = ridgeStroke;
+        g.lineWidth = low ? 1 : 2;
+        g.lineJoin = 'round';
+        g.lineCap = 'round';
+        g.beginPath();
+        if (pts.length >= 3) {
+            g.moveTo(pts[0], pts[1]);
+            for (var pi = 3; pi < pts.length; pi += 3) g.lineTo(pts[pi], pts[pi + 1]);
+        }
+        g.stroke();
+        g.restore();
+
+        // Snow caps (only for layers with snow, skip in low-power)
+        if (layer.snow && !low) {
+            var threshold = (layer.snowLine || 0.75) * layer.amp;
+            g.save();
+            g.globalAlpha = (theme === 'day') ? 0.22 : 0.15;
+            g.strokeStyle = snowStroke;
+            g.lineWidth = 2;
+            g.lineJoin = 'round';
+            g.lineCap = 'round';
+            g.beginPath();
+            var inSeg = false;
+            for (var si = 0; si < pts.length; si += 3) {
+                var spx = pts[si], spy = pts[si + 1], sphh = pts[si + 2];
+                if (sphh > threshold) {
+                    if (!inSeg) { g.moveTo(spx, spy + 1); inSeg = true; }
+                    else g.lineTo(spx, spy + 1);
+                } else { inSeg = false; }
+            }
+            g.stroke();
+            g.restore();
+        }
+
+        return { canvas: canvas };
+    }
+
+    // Fog gradients per theme
+    function buildFogGrad(ctx, h, theme) {
+        var fog = ctx.createLinearGradient(0, h * 0.35, 0, h);
+        if (theme === 'day') {
+            fog.addColorStop(0, 'rgba(255,255,255,0.00)');
+            fog.addColorStop(0.72, 'rgba(220,235,255,0.10)');
+            fog.addColorStop(1, 'rgba(200,230,255,0.14)');
+        } else if (theme === 'dawn') {
+            fog.addColorStop(0, 'rgba(255,120,180,0.00)');
+            fog.addColorStop(0.72, 'rgba(255,170,140,0.06)');
+            fog.addColorStop(1, 'rgba(190,210,255,0.10)');
+        } else if (theme === 'dusk') {
+            fog.addColorStop(0, 'rgba(170,140,255,0.00)');
+            fog.addColorStop(0.72, 'rgba(255,160,120,0.05)');
+            fog.addColorStop(1, 'rgba(140,170,230,0.10)');
+        } else { // night
+            fog.addColorStop(0, 'rgba(190,210,255,0.00)');
+            fog.addColorStop(0.72, 'rgba(160,180,255,0.06)');
+            fog.addColorStop(1, 'rgba(110,140,210,0.12)');
+        }
+        return fog;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 5) Core draw function
+    // ─────────────────────────────────────────────────────────────────────────
+    function drawMountainsV2(renderer, cam, time) {
+        var ctx = renderer.ctx;
+        var w = renderer.w | 0;
+        var h = renderer.h | 0;
+        if (!ctx || w <= 0 || h <= 0) return;
+
+        // User/perf setting check
+        try {
+            var gs = window.GAME_SETTINGS || {};
+            if (gs.bgMountains === false) return;
+            if (gs.__bgMountainsEffective === false) return;
+        } catch (_) {}
+
+        var low = !!renderer.lowPower;
+        var step = low ? 24 : 12;
+        var layers = low ? LAYERS.slice(0, 3) : LAYERS;
+        var theme = getTheme(renderer, time);
+
+        // Cache management — keyed by theme + dimensions + quality
+        var cacheKey = theme + '|' + w + '|' + h + '|' + (low ? 1 : 0) + '|' + step;
+        var cache = renderer.__mpv2_cache;
+        if (!cache || cache.key !== cacheKey) {
+            cache = renderer.__mpv2_cache = {
+                key: cacheKey,
+                theme: theme,
+                w: w,
+                h: h,
+                low: low,
+                step: step,
+                layerMaps: [],
+                fogGrad: null,
+                fogCtx: null
+            };
+            for (var i = 0; i < layers.length; i++) cache.layerMaps.push(new Map());
+        }
+        // Ensure layer count matches
+        while (cache.layerMaps.length < layers.length) cache.layerMaps.push(new Map());
+        if (cache.layerMaps.length > layers.length) cache.layerMaps.length = layers.length;
+
+        // Draw layers back-to-front
+        for (var li = 0; li < layers.length; li++) {
+            var layer = layers[li];
+            var map = cache.layerMaps[li];
+            var camP = (cam.x || 0) * layer.p;
+
+            var startWX = camP - 80;
+            var endWX = camP + w + 80;
+            var first = Math.floor(startWX / CHUNK_W);
+            var last = Math.floor(endWX / CHUNK_W);
+            var keepMin = first - PAD_CHUNKS;
+            var keepMax = last + PAD_CHUNKS;
+
+            // Generate missing chunks
+            for (var ci = keepMin; ci <= keepMax; ci++) {
+                if (!map.has(ci)) {
+                    map.set(ci, buildChunk(layer, li, ci, theme, h, step, low));
+                }
+            }
+
+            // Evict distant chunks
+            var keysToDelete = [];
+            map.forEach(function(v, k) {
+                if (k < keepMin || k > keepMax) keysToDelete.push(k);
+            });
+            for (var di = 0; di < keysToDelete.length; di++) map.delete(keysToDelete[di]);
+
+            // Draw visible chunks
+            for (var ci2 = first; ci2 <= last; ci2++) {
+                var chunk = map.get(ci2);
+                if (!chunk || !chunk.canvas) continue;
+                var dx = (ci2 * CHUNK_W) - camP;
+                try {
+                    ctx.drawImage(chunk.canvas, OVERLAP, 0, CHUNK_W, h, dx, 0, CHUNK_W, h);
+                } catch (_) { /* graceful degrade */ }
+            }
+        }
+
+        // Fog overlay
+        if (cache.fogCtx !== ctx || !cache.fogGrad) {
+            cache.fogGrad = buildFogGrad(ctx, h, theme);
+            cache.fogCtx = ctx;
+        }
+        ctx.save();
+        ctx.fillStyle = cache.fogGrad;
+        ctx.fillRect(0, h * 0.35, w, h);
+        ctx.restore();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 6) Hook into render pipeline with TWO insertion points for robustness:
+    //
+    //    A) renderParallax — the "normal" path. Called after sky, before tiles.
+    //       This is the ideal position. We replace it to call drawMountainsV2.
+    //
+    //    B) renderWorld wrapper — fallback. If renderParallax was skipped
+    //       (reduced-motion, low-perf, patched render loop, worker path),
+    //       we draw mountains BEFORE tiles inside renderWorld.
+    //
+    //    A per-renderer flag (__mpv2_drawn) ensures mountains are drawn
+    //    exactly ONCE regardless of which path fires first.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // A) Replace renderParallax — primary path (after sky, before tiles)
+    Renderer.prototype.renderParallax = function (cam, time) {
+        this.__mpv2_drawn = true; // mark that we drew mountains this frame
+        try {
+            drawMountainsV2(this, cam, typeof time === 'number' ? time : 0.5);
+        } catch (e) {
+            if (typeof console !== 'undefined' && console.debug) console.debug('[MountainPatchV2] parallax draw error:', e);
+        }
+    };
+
+    // B) Wrap renderWorld — fallback path
+    //    If renderParallax was already called this frame (flag set), skip.
+    //    Otherwise draw mountains now (before tiles). Always reset the flag.
+    var _finalRenderWorld = Renderer.prototype.renderWorld;
+    Renderer.prototype.renderWorld = function (world, cam, time) {
+        if (!this.__mpv2_drawn) {
+            // renderParallax was skipped — draw mountains now as fallback
+            try {
+                drawMountainsV2(this, cam, time);
+            } catch (e) {
+                if (typeof console !== 'undefined' && console.debug) console.debug('[MountainPatchV2] renderWorld draw error:', e);
+            }
+        }
+        // Reset flag for next frame
+        this.__mpv2_drawn = false;
+        // Proceed with original (or wrapped) renderWorld for tile rendering
+        return _finalRenderWorld.call(this, world, cam, time);
+    };
+
+    // Mark so no future patch re-wraps mountains
+    Renderer.prototype.__mountainPatchV2 = true;
+
+    try { console.info('[MountainPatchV2] Loaded — self-contained parallax mountain renderer active.'); } catch (_) {}
+})();
+</script>
+
 </body>
 
 </html>
